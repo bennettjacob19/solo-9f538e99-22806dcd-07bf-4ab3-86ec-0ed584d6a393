@@ -62,6 +62,20 @@ CREATE TABLE IF NOT EXISTS silences (
     reason     TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL
 );
+
+-- Single-probe heartbeat monitoring. One row (id = 1); deadline_at is always
+-- computed from the server-side receive time of the last heartbeat, so the
+-- deadline survives restarts and never depends on the probe's clock.
+CREATE TABLE IF NOT EXISTS probe_state (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    timeout_seconds REAL NOT NULL,
+    last_beat_at    REAL,
+    deadline_at     REAL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'online', 'lost')),
+    lost_round      INTEGER NOT NULL DEFAULT 0,
+    updated_at      REAL NOT NULL
+);
 """
 
 

@@ -17,10 +17,13 @@ function badge(status) {
 }
 
 async function refresh() {
-  const [alertsData, notifData] = await Promise.all([
+  const [alertsData, notifData, probeData] = await Promise.all([
     getJSON("/api/alerts"),
     getJSON("/api/notifications"),
+    getJSON("/api/probe"),
   ]);
+
+  renderProbe(probeData);
 
   const s = alertsData.silence;
   $("#silence-state").innerHTML = s.active
@@ -57,6 +60,39 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+
+const PROBE_STATUS_TEXT = { pending: "待接入", online: "在线", lost: "失联" };
+
+function renderProbe(p) {
+  if (!p.configured) {
+    $("#probe-state").innerHTML =
+      '<span class="badge badge-pending">待接入</span> ' +
+      '<span class="muted">尚未设置超时阈值，也没有收到过心跳</span>';
+    return;
+  }
+  const parts = [
+    `<span class="badge badge-${p.status}">${PROBE_STATUS_TEXT[p.status] || p.status}</span>`,
+    `超时阈值 ${p.timeout_seconds}s`,
+    `最近心跳 ${fmt(p.last_beat_at)}`,
+    `当前期限 ${fmt(p.deadline_at)}`,
+  ];
+  if (p.status === "online" && p.remaining_seconds != null) {
+    parts.push(`剩余 ${Math.max(0, Math.ceil(p.remaining_seconds))}s`);
+  }
+  parts.push(`失联轮次 ${p.lost_round}`);
+  $("#probe-state").innerHTML = parts.join('<span class="muted"> · </span>');
+}
+
+$("#probe-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const resp = await fetch("/api/probe/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ timeout_seconds: Number($("#probe-timeout").value) }),
+  });
+  if (!resp.ok) alert("设置失败: " + (await resp.text()));
+  refresh();
+});
 
 $("#silence-form").addEventListener("submit", async (e) => {
   e.preventDefault();

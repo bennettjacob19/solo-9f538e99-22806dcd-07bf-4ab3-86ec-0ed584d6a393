@@ -13,6 +13,20 @@
 </header>
 
 <section class="card">
+  <h2>探针心跳监测</h2>
+  <div id="probe-state" class="muted">加载中…</div>
+  <form id="probe-form">
+    <label>超时时间（秒）
+      <input type="number" id="probe-timeout" min="1" step="1" value="30" required>
+    </label>
+    <button type="submit">设置超时阈值</button>
+  </form>
+  <p class="hint">探针调用 <code>POST /api/probe/heartbeat</code> 上报心跳，期限按服务端接收时间计算。
+    首次心跳前为「待接入」，不报失联；超时未心跳转为「失联」并只产生一轮失联告警；
+    恢复心跳后自动恢复，失联的触发与恢复同样经过静默和发件箱顺序投递。</p>
+</section>
+
+<section class="card">
   <h2>服务静默</h2>
   <div id="silence-state" class="muted">加载中…</div>
   <form id="silence-form">

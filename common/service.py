@@ -1,6 +1,7 @@
 """Core alerting logic: event ingestion, silences and the notification outbox."""
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from typing import Any, Callable, Optional
@@ -8,6 +9,14 @@ from typing import Any, Callable, Optional
 from .db import transaction
 
 VALID_KINDS = ("firing", "recovery")
+
+# The single monitored probe reports its lost/recovered transitions through the
+# normal alert pipeline under this reserved fingerprint. Normal events may not
+# use the "probe:" prefix, so probe alerts and regular events can never
+# overwrite each other's state.
+PROBE_FP_PREFIX = "probe:"
+PROBE_FINGERPRINT = f"{PROBE_FP_PREFIX}heartbeat"
+DEFAULT_PROBE_TIMEOUT_SECONDS = 60.0
 
 
 class Reject(Exception):
@@ -28,6 +37,12 @@ def validate_event(payload: Any) -> dict:
     fingerprint = payload.get("fingerprint")
     if not isinstance(fingerprint, str) or not fingerprint.strip():
         raise Reject("invalid_payload", "fingerprint must be a non-empty string")
+    if fingerprint.startswith(PROBE_FP_PREFIX):
+        raise Reject(
+            "reserved_fingerprint",
+            f"fingerprints starting with {PROBE_FP_PREFIX!r} are reserved for "
+            "probe heartbeat monitoring",
+        )
     seq = payload.get("seq")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
         raise Reject("invalid_payload", "seq must be a non-negative integer")
@@ -381,3 +396,208 @@ def dispatch_pending(
                     }
                 )
     return results
+
+
+# --------------------------------------------------------------------------- #
+# Probe heartbeat monitoring (single probe)
+# --------------------------------------------------------------------------- #
+def _probe_row(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM probe_state WHERE id=1").fetchone()
+
+
+def _probe_expired(row: sqlite3.Row, now: float) -> bool:
+    return row["deadline_at"] is not None and now > row["deadline_at"]
+
+
+def get_probe(conn: sqlite3.Connection, now: Optional[float] = None) -> dict:
+    now = time.time() if now is None else now
+    row = _probe_row(conn)
+    if row is None:
+        return {
+            "configured": False,
+            "status": "pending",
+            "timeout_seconds": None,
+            "last_beat_at": None,
+            "deadline_at": None,
+            "remaining_seconds": None,
+            "lost_round": 0,
+            "now": now,
+        }
+    remaining = None
+    if row["status"] == "online" and row["deadline_at"] is not None:
+        remaining = round(row["deadline_at"] - now, 3)
+    return {
+        "configured": True,
+        "status": row["status"],
+        "timeout_seconds": row["timeout_seconds"],
+        "last_beat_at": row["last_beat_at"],
+        "deadline_at": row["deadline_at"],
+        "remaining_seconds": remaining,
+        "lost_round": row["lost_round"],
+        "now": now,
+    }
+
+
+def set_probe_timeout(
+    conn: sqlite3.Connection, timeout_seconds: float, now: Optional[float] = None
+) -> dict:
+    """Create/update the probe threshold. The deadline is recomputed from the
+    last heartbeat (if any), so tightening the timeout can make an already
+    overdue probe expire on the next sweep."""
+    now = time.time() if now is None else now
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise Reject("invalid_payload", "timeout_seconds must be a positive finite number")
+    with transaction(conn):
+        row = _probe_row(conn)
+        if row is None:
+            conn.execute(
+                "INSERT INTO probe_state(id, timeout_seconds, last_beat_at, "
+                "deadline_at, status, lost_round, updated_at) "
+                "VALUES (1, ?, NULL, NULL, 'pending', 0, ?)",
+                (timeout_seconds, now),
+            )
+        else:
+            deadline = None
+            if row["last_beat_at"] is not None:
+                deadline = row["last_beat_at"] + timeout_seconds
+            conn.execute(
+                "UPDATE probe_state SET timeout_seconds=?, deadline_at=?, "
+                "updated_at=? WHERE id=1",
+                (timeout_seconds, deadline, now),
+            )
+    return get_probe(conn, now)
+
+
+def _probe_alert_transition(
+    conn: sqlite3.Connection, kind: str, round_no: int, summary: str, now: float
+) -> list[dict]:
+    """Drive the reserved probe fingerprint through the regular alert pipeline.
+
+    Synthetic seqs (2*round-1 firing, 2*round recovery) keep the per-fingerprint
+    history strictly increasing, and _apply_notification_policy applies the
+    exact same silence/outbox-ordering rules as for normal events.
+    """
+    fp = PROBE_FINGERPRINT
+    seq = round_no * 2 - 1 if kind == "firing" else round_no * 2
+    status = "firing" if kind == "firing" else "recovered"
+    row = conn.execute(
+        "SELECT 1 FROM alerts WHERE fingerprint=?", (fp,)
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO alerts(fingerprint, current_seq, status, summary, round, "
+            "last_event_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (fp, seq, status, summary, round_no, now, now),
+        )
+    else:
+        conn.execute(
+            "UPDATE alerts SET current_seq=?, status=?, summary=?, round=?, "
+            "last_event_at=?, updated_at=? WHERE fingerprint=?",
+            (seq, status, summary, round_no, now, now, fp),
+        )
+    conn.execute(
+        "INSERT INTO events(fingerprint, seq, kind, summary, received_at) "
+        "VALUES (?,?,?,?,?)",
+        (fp, seq, kind, summary, now),
+    )
+    return _apply_notification_policy(conn, fp, round_no, kind, summary, now)
+
+
+def _mark_probe_lost(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> dict:
+    """One lost round: alert goes firing and the probe flips to 'lost'.
+
+    Callers hold a write transaction and only call this while the probe is
+    'online' and expired, so each expiry produces exactly one round.
+    """
+    round_no = row["lost_round"] + 1
+    timeout = row["timeout_seconds"]
+    summary = f"probe heartbeat lost: no beat within {timeout:g}s"
+    enqueued = _probe_alert_transition(conn, "firing", round_no, summary, now)
+    conn.execute(
+        "UPDATE probe_state SET status='lost', lost_round=?, updated_at=? WHERE id=1",
+        (round_no, now),
+    )
+    return {"transition": "lost", "round": round_no, "notifications_enqueued": enqueued}
+
+
+def _mark_probe_recovered(conn: sqlite3.Connection, round_no: int, now: float) -> dict:
+    summary = "probe heartbeat restored"
+    enqueued = _probe_alert_transition(conn, "recovery", round_no, summary, now)
+    return {
+        "transition": "recovered",
+        "round": round_no,
+        "notifications_enqueued": enqueued,
+    }
+
+
+def record_heartbeat(
+    conn: sqlite3.Connection,
+    now: Optional[float] = None,
+    default_timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+) -> dict:
+    """Record one heartbeat. The deadline always counts from the server-side
+    receive time, never from a client-supplied timestamp.
+
+    A heartbeat that arrives after the deadline but before the sweep wrote the
+    lost state still records the lost round first and recovers right after, so
+    the outage is never silently swallowed.
+    """
+    now = time.time() if now is None else now
+    transitions: list[dict] = []
+    with transaction(conn):
+        row = _probe_row(conn)
+        if row is None:
+            # First contact before any threshold was configured: adopt the
+            # default timeout so the probe is monitored from now on.
+            conn.execute(
+                "INSERT INTO probe_state(id, timeout_seconds, last_beat_at, "
+                "deadline_at, status, lost_round, updated_at) "
+                "VALUES (1, ?, ?, ?, 'online', 0, ?)",
+                (default_timeout, now, now + default_timeout, now),
+            )
+            first = True
+        elif row["last_beat_at"] is None:
+            # First heartbeat after configuration: pending -> online, no alert.
+            conn.execute(
+                "UPDATE probe_state SET status='online', last_beat_at=?, "
+                "deadline_at=?, updated_at=? WHERE id=1",
+                (now, now + row["timeout_seconds"], now),
+            )
+            first = True
+        else:
+            first = False
+            lost_round = row["lost_round"]
+            if row["status"] == "online" and _probe_expired(row, now):
+                # Late heartbeat: record the lost round before recovering.
+                transitions.append(_mark_probe_lost(conn, row, now))
+                lost_round += 1
+                status = "lost"
+            else:
+                status = row["status"]
+            if status == "lost":
+                transitions.append(_mark_probe_recovered(conn, lost_round, now))
+            conn.execute(
+                "UPDATE probe_state SET status='online', last_beat_at=?, "
+                "deadline_at=?, updated_at=? WHERE id=1",
+                (now, now + row["timeout_seconds"], now),
+            )
+    result = get_probe(conn, now)
+    result["first_heartbeat"] = first
+    result["transitions"] = transitions
+    return result
+
+
+def sweep_probes(conn: sqlite3.Connection, now: Optional[float] = None) -> list[dict]:
+    """Mark the probe lost when its deadline has passed.
+
+    Runs inside the same serialized transaction as heartbeats, so a concurrent
+    heartbeat cannot produce a second lost round; continued absence after the
+    transition does not re-fire (status is no longer 'online').
+    """
+    now = time.time() if now is None else now
+    transitions: list[dict] = []
+    with transaction(conn):
+        row = _probe_row(conn)
+        if row is not None and row["status"] == "online" and _probe_expired(row, now):
+            transitions.append(_mark_probe_lost(conn, row, now))
+    return transitions

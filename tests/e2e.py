@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -21,6 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from runner.http_runner import run_alert_service, run_notifier_service  # noqa: E402
+from common import service  # noqa: E402
+from common.db import close, connect, init_db  # noqa: E402
 
 ALERT_PORT = 18080
 NOTIFIER_PORT = 18081
@@ -82,6 +85,21 @@ def wait_delivered(fp, expected_count, timeout=10.0):
             return None
         return rows if all(r["status"] == "delivered" for r in rows) else None
     return wait_until(f"{fp} {expected_count} delivered", check, timeout)
+
+
+PROBE_FP = "probe:heartbeat"
+
+
+def probe_state():
+    _, data = http("GET", f"{BASE}/api/probe")
+    return data
+
+
+def probe_round_delivered(round_no, kind):
+    return any(
+        r["round"] == round_no and r["kind"] == kind and r["status"] == "delivered"
+        for r in outbox_rows(PROBE_FP)
+    )
 
 
 class E2ETestCase(unittest.TestCase):
@@ -297,6 +315,8 @@ class E2ETestCase(unittest.TestCase):
         http("POST", f"{BASE}/api/events",
              {"fingerprint": "x", "seq": 1, "kind": "explode", "summary": "x"}, expect=409)
         http("POST", f"{BASE}/api/silence", {"duration_seconds": -3}, expect=422)
+        http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 0}, expect=422)
+        http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": -5}, expect=422)
 
     def test_08_restart_does_not_lose_or_reorder(self):
         # Persist a partially delivered outbox, restart both servers, verify
@@ -349,6 +369,214 @@ class E2ETestCase(unittest.TestCase):
              {"fingerprint": fp, "seq": 2, "kind": "firing", "summary": "late again"},
              expect=409)
         self.assertEqual(alert_status(fp)["status"], "recovered")
+
+    def test_09_probe_lifecycle_and_single_lost_round(self):
+        fp = PROBE_FP
+        # nothing configured yet: pending, and certainly no lost alert
+        p = probe_state()
+        self.assertFalse(p["configured"])
+        self.assertEqual(p["status"], "pending")
+
+        # configure the threshold: still pending until the first heartbeat
+        http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 1.5}, expect=200)
+        self.assertEqual(probe_state()["status"], "pending")
+
+        # no lost alert before the first heartbeat, even well past the timeout
+        time.sleep(2.0)
+        self.assertEqual(probe_state()["status"], "pending")
+        self.assertEqual(outbox_rows(fp), [])
+
+        # first heartbeat -> online, deadline counts from server receive time
+        _, p = http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+        self.assertTrue(p["first_heartbeat"])
+        self.assertEqual(p["status"], "online")
+        self.assertAlmostEqual(p["deadline_at"] - p["last_beat_at"], 1.5, places=3)
+
+        # expiry -> exactly one lost round, firing notification delivered
+        wait_until("probe lost", lambda: probe_state()["status"] == "lost")
+        rows = wait_delivered(fp, 1)
+        self.assertEqual([(r["round"], r["kind"]) for r in rows], [(1, "firing")])
+
+        # continued absence does NOT produce another round
+        time.sleep(2.5)
+        p = probe_state()
+        self.assertEqual(p["status"], "lost")
+        self.assertEqual(p["lost_round"], 1)
+        self.assertEqual(len(outbox_rows(fp)), 1)
+
+        # heartbeat returns -> recovery follows the firing through the outbox
+        _, p = http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+        self.assertEqual(p["status"], "online")
+        rows = wait_delivered(fp, 2)
+        self.assertEqual([r["kind"] for r in rows], ["firing", "recovery"])
+        recv = received_nos()
+        times = [recv[r["notification_no"]]["first_seen_at"] for r in rows]
+        self.assertEqual(times, sorted(times))
+
+        # expiring again starts exactly one more round (round 2, not more)
+        wait_until("probe lost again", lambda: probe_state()["status"] == "lost")
+        self.assertEqual(probe_state()["lost_round"], 2)
+        rows = wait_delivered(fp, 3)
+        self.assertEqual([r["kind"] for r in rows], ["firing", "recovery", "firing"])
+
+        # recover and park the probe with a long timeout for later tests
+        http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+        rows = wait_delivered(fp, 4)
+        self.assertEqual([r["kind"] for r in rows],
+                         ["firing", "recovery", "firing", "recovery"])
+        http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 300}, expect=200)
+
+    def test_10_probe_silence_rules_and_reserved_namespace(self):
+        fp = PROBE_FP
+        p = probe_state()
+        self.assertEqual(p["status"], "online")
+        round0 = p["lost_round"]
+
+        # normal events may not use the reserved probe namespace
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 1, "kind": "firing", "summary": "fake"},
+             expect=409)
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": "probe:other", "seq": 1, "kind": "firing", "summary": "x"},
+             expect=409)
+        # ...and the probe alert was not overwritten by those attempts
+        self.assertEqual(probe_state()["lost_round"], round0)
+
+        # silence the console, refresh the heartbeat, then tighten the timeout
+        # (the deadline is recomputed from the fresh beat, ~1s out)
+        http("POST", f"{BASE}/api/silence",
+             {"duration_seconds": 60, "reason": "probe silence test"}, expect=200)
+        try:
+            http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+            http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 1}, expect=200)
+            wait_until("probe lost under silence",
+                       lambda: probe_state()["status"] == "lost")
+            self.assertEqual(probe_state()["lost_round"], round0 + 1)
+            # silenced: the lost firing is parked, nothing enqueued for the new round
+            self.assertEqual(
+                [r for r in outbox_rows(fp) if r["round"] == round0 + 1], [])
+
+            # releasing the silence parks the still-lost probe into the outbox
+            http("DELETE", f"{BASE}/api/silence", expect=200)
+            wait_until("lost firing released",
+                       lambda: probe_round_delivered(round0 + 1, "firing"))
+
+            # recovery must not overtake the firing even with lost receipts
+            http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+            wait_until("probe recovery delivered",
+                       lambda: probe_round_delivered(round0 + 1, "recovery"))
+            recv = received_nos()
+            self.assertLess(recv[f"{fp}#r{round0 + 1}:firing"]["first_seen_at"],
+                            recv[f"{fp}#r{round0 + 1}:recovery"]["first_seen_at"])
+        finally:
+            http("DELETE", f"{BASE}/api/silence")
+
+        # park the probe again for the restart test
+        http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 300}, expect=200)
+
+    def test_11_probe_deadline_survives_restart(self):
+        round0 = probe_state()["lost_round"]
+        # fresh heartbeat first, then tighten the timeout so the deadline is
+        # ~2s out (config recomputes it from the last beat)
+        http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+        _, p = http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 2},
+                    expect=200)
+        deadline, last_beat = p["deadline_at"], p["last_beat_at"]
+
+        # restart the alert service on the same database file
+        self.alert_server.stop_event.set()
+        self.alert_server.shutdown()
+        self.alert_server.server_close()
+        time.sleep(0.2)
+        type(self).alert_server = run_alert_service("127.0.0.1", ALERT_PORT)
+        wait_until("alert service healthy after restart",
+                   lambda: http("GET", f"{BASE}/health")[0] == 200)
+
+        # the stored deadline is still in effect, not reset by the restart
+        p2 = probe_state()
+        self.assertEqual(p2["status"], "online")
+        self.assertAlmostEqual(p2["deadline_at"], deadline, places=3)
+        self.assertAlmostEqual(p2["last_beat_at"], last_beat, places=3)
+
+        # without new heartbeats the persisted deadline expires: one lost round
+        wait_until("probe lost after restart",
+                   lambda: probe_state()["status"] == "lost")
+        self.assertEqual(probe_state()["lost_round"], round0 + 1)
+        wait_until("lost firing delivered",
+                   lambda: probe_round_delivered(round0 + 1, "firing"))
+
+        # recover after the restart and park the probe
+        http("POST", f"{BASE}/api/probe/heartbeat", expect=200)
+        wait_until("recovery delivered",
+                   lambda: probe_round_delivered(round0 + 1, "recovery"))
+        http("POST", f"{BASE}/api/probe/config", {"timeout_seconds": 300}, expect=200)
+
+    def test_12_probe_late_heartbeat_and_sweep_concurrency(self):
+        # Service-level test with explicit clocks: a heartbeat that arrives
+        # after the deadline but before the sweep ran must still record the
+        # lost round first and recover right after; concurrent sweeps and
+        # heartbeats must never produce two rounds for one expiry.
+        db_path = os.path.join(self.tmpdir, "probe-concurrency.db")
+        init_db(db_path)
+        conn = connect(db_path)
+        try:
+            service.set_probe_timeout(conn, 10, now=100.0)
+            r = service.record_heartbeat(conn, now=100.0)
+            self.assertEqual((r["status"], r["first_heartbeat"]), ("online", True))
+
+            # expired at 110; heartbeat at 115 lands before any sweep
+            r = service.record_heartbeat(conn, now=115.0)
+            self.assertEqual([t["transition"] for t in r["transitions"]],
+                             ["lost", "recovered"])
+            self.assertEqual(r["status"], "online")
+            self.assertEqual(r["lost_round"], 1)
+            self.assertAlmostEqual(r["deadline_at"], 125.0)
+            # the lost round is on record: alert history + outbox rows
+            events = service.list_events(conn, PROBE_FP)
+            self.assertEqual([(e["seq"], e["kind"]) for e in reversed(events)],
+                             [(1, "firing"), (2, "recovery")])
+            kinds = sorted((n["round"], n["kind"]) for n in
+                           service.list_notifications(conn))
+            self.assertEqual(kinds, [(1, "firing"), (1, "recovery")])
+
+            # sweep before the new deadline: nothing; after it: one lost round
+            self.assertEqual(service.sweep_probes(conn, now=120.0), [])
+            lost = service.sweep_probes(conn, now=126.0)
+            self.assertEqual([t["transition"] for t in lost], ["lost"])
+            # already lost: further sweeps do not repeat
+            self.assertEqual(service.sweep_probes(conn, now=130.0), [])
+            r = service.record_heartbeat(conn, now=131.0)
+            self.assertEqual([t["transition"] for t in r["transitions"]], ["recovered"])
+
+            # refresh inside the deadline, then race sweeps vs heartbeats
+            r = service.record_heartbeat(conn, now=140.0)
+            self.assertEqual(r["transitions"], [])
+            self.assertAlmostEqual(r["deadline_at"], 150.0)
+
+            threads = []
+            for _ in range(4):
+                threads.append(threading.Thread(
+                    target=service.sweep_probes, args=(conn,), kwargs={"now": 155.0}))
+                threads.append(threading.Thread(
+                    target=service.record_heartbeat, args=(conn,), kwargs={"now": 155.0}))
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # exactly one lost round came out of the race (round 3), never two
+            p = service.get_probe(conn, now=156.0)
+            self.assertEqual(p["status"], "online")
+            self.assertEqual(p["lost_round"], 3)
+            notes = service.list_notifications(conn)
+            self.assertEqual(
+                sorted((n["round"], n["kind"]) for n in notes),
+                [(1, "firing"), (1, "recovery"), (2, "firing"), (2, "recovery"),
+                 (3, "firing"), (3, "recovery")])
+            events = service.list_events(conn, PROBE_FP)
+            self.assertEqual(len(events), 6)  # no duplicated synthetic events
+        finally:
+            close(conn)
 
 
 if __name__ == "__main__":

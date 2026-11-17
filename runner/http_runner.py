@@ -170,6 +170,7 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
             try:
                 service.dispatch_pending(conn, send)
                 service.sweep_silences(conn)
+                service.sweep_probes(conn)
             except Exception as exc:  # pragma: no cover - resilience
                 print(f"[worker] tick failed: {exc!r}", flush=True)
             stop.wait(cfg.worker_interval_seconds)
@@ -210,6 +211,22 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
         result["released"] = service.sweep_silences(conn)
         return result
 
+    def h_probe_get(_: Any) -> dict:
+        return service.get_probe(conn)
+
+    def h_probe_config(body: Any) -> dict:
+        if not isinstance(body, dict) or body.get("timeout_seconds") is None:
+            raise ValueError("timeout_seconds is required")
+        timeout = float(body["timeout_seconds"])
+        if timeout <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        return service.set_probe_timeout(conn, timeout)
+
+    def h_probe_heartbeat(_: Any) -> dict:
+        return service.record_heartbeat(
+            conn, default_timeout=cfg.probe_default_timeout_seconds
+        )
+
     import os
     web_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
     web_index = os.path.join(web_root, "index.html")
@@ -223,6 +240,9 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
             ("GET", "/api/silence", h_silence_get),
             ("POST", "/api/silence", h_silence_set),
             ("DELETE", "/api/silence", h_silence_clear),
+            ("GET", "/api/probe", h_probe_get),
+            ("POST", "/api/probe/config", h_probe_config),
+            ("POST", "/api/probe/heartbeat", h_probe_heartbeat),
         ],
         "static_index": web_index,
         "static_dir": os.path.join(web_root, "static"),

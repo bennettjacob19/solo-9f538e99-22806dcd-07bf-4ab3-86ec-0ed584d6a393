@@ -47,6 +47,7 @@ class Worker(threading.Thread):
             try:
                 service.dispatch_pending(_conn, self._send)
                 service.sweep_silences(_conn)
+                service.sweep_probes(_conn)
             except Exception as exc:  # worker must never die
                 print(f"[worker] tick failed: {exc!r}", flush=True)
             self._stop.wait(config.worker_interval_seconds)
@@ -85,6 +86,10 @@ class SilenceIn(BaseModel):
     duration_seconds: Optional[float] = Field(default=None, ge=0)
     until_ts: Optional[float] = None
     reason: str = ""
+
+
+class ProbeConfigIn(BaseModel):
+    timeout_seconds: float = Field(gt=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +150,29 @@ def delete_silence() -> dict:
     # the outbox instead of waiting for the next worker tick.
     result["released"] = service.sweep_silences(_conn)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Probe heartbeat monitoring
+# --------------------------------------------------------------------------- #
+@app.get("/api/probe")
+def get_probe_state() -> dict:
+    return service.get_probe(_conn)
+
+
+@app.post("/api/probe/config")
+def set_probe_config(body: ProbeConfigIn) -> dict:
+    try:
+        return service.set_probe_timeout(_conn, body.timeout_seconds)
+    except service.Reject as exc:
+        raise HTTPException(status_code=409, detail={"error": exc.code, "message": exc.message})
+
+
+@app.post("/api/probe/heartbeat")
+def post_probe_heartbeat() -> dict:
+    return service.record_heartbeat(
+        _conn, default_timeout=config.probe_default_timeout_seconds
+    )
 
 
 # --------------------------------------------------------------------------- #

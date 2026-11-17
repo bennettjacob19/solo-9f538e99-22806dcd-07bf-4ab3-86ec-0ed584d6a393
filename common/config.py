@@ -18,6 +18,7 @@ class AppConfig:
     notifier_url: str = ""
     worker_interval_seconds: float = 0.0
     notify_timeout_seconds: float = 0.0
+    probe_default_timeout_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         self.db_path = self.db_path or _env("ALERT_DB_PATH", "/data/alerts.db")
@@ -31,6 +32,12 @@ class AppConfig:
         )
         self.notify_timeout_seconds = self.notify_timeout_seconds or float(
             _env("NOTIFY_TIMEOUT_SECONDS", "3")
+        )
+        # Timeout applied when a heartbeat arrives before any threshold was
+        # configured on the console (the probe row is auto-created with it).
+        self.probe_default_timeout_seconds = (
+            self.probe_default_timeout_seconds
+            or float(_env("PROBE_DEFAULT_TIMEOUT_SECONDS", "60"))
         )
 
 
